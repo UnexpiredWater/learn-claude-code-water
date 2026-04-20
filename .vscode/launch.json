@@ -1,0 +1,41 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug: my_subagent.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/agents/my_subagent.py",
+            "console": "integratedTerminal",
+            "args": ["帮我分析当前项目的目录结构"],
+            "cwd": "${workspaceFolder}",
+            "python": "${command:python.interpreterPath}",
+            "env": {
+                "PYTHONIOENCODING": "utf-8"
+            },
+            "justMyCode": false
+        },
+        {
+            "name": "Debug: my_subagent.py (自定义任务)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/agents/my_subagent.py",
+            "console": "integratedTerminal",
+            "args": ["${input:taskDescription}"],
+            "cwd": "${workspaceFolder}",
+            "python": "${command:python.interpreterPath}",
+            "env": {
+                "PYTHONIOENCODING": "utf-8"
+            },
+            "justMyCode": false
+        }
+    ],
+    "inputs": [
+        {
+            "id": "taskDescription",
+            "type": "promptString",
+            "description": "请输入要执行的任务描述",
+            "default": "帮我分析当前项目的目录结构"
+        }
+    ]
+}
