@@ -7,7 +7,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/agents/my_subagent.py",
             "console": "integratedTerminal",
-            "args": ["帮我分析当前项目的目录结构"],
+            "args": ["使用html实现一个记账程序"],
             "cwd": "${workspaceFolder}",
             "python": "${command:python.interpreterPath}",
             "env": {

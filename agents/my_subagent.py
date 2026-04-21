@@ -38,12 +38,56 @@ SYSTEM = f"""你是一个编码子 Agent，工作目录在 {WORKDIR}。
 你的任务是完成用户指定的目标。你可以使用以下工具：
 - bash: 运行 shell 命令
 - read_file: 读取文件内容
-- write_file: 写入文件内容
+- write_file: 写入文件内容（创建或覆盖文件）
 - edit_file: 替换文件中的文本
-- create_file: 创建新文件
+- todo: 更新任务列表，跟踪多步骤任务的进度
 
+使用 todo 工具来规划多步骤任务。开始任务前标记为 in_progress，完成后标记为 completed。
 完成所有任务后，请提供一个简洁的总结。
 """
+
+
+# -- TodoManager: 结构化状态管理 --
+class TodoManager:
+    def __init__(self):
+        self.items = []
+
+    def update(self, items: list) -> str:
+        """更新 todo 列表"""
+        if len(items) > 20:
+            raise ValueError("最多允许 20 个 todo 项")
+        validated = []
+        in_progress_count = 0
+        for i, item in enumerate(items):
+            text = str(item.get("text", "")).strip()
+            status = str(item.get("status", "pending")).lower()
+            item_id = str(item.get("id", str(i + 1)))
+            if not text:
+                raise ValueError(f"项目 {item_id}: 需要文本内容")
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"项目 {item_id}: 无效的状态 '{status}'")
+            if status == "in_progress":
+                in_progress_count += 1
+            validated.append({"id": item_id, "text": text, "status": status})
+        if in_progress_count > 1:
+            raise ValueError("同时只能有一个任务处于 in_progress 状态")
+        self.items = validated
+        return self.render()
+
+    def render(self) -> str:
+        """渲染 todo 列表"""
+        if not self.items:
+            return "没有 todo 项。"
+        lines = []
+        for item in self.items:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
+            lines.append(f"{marker} #{item['id']}: {item['text']}")
+        done = sum(1 for t in self.items if t["status"] == "completed")
+        lines.append(f"\n(已完成 {done}/{len(self.items)} 项)")
+        return "\n".join(lines)
+
+
+TODO = TodoManager()
 
 
 # -- 工具实现 --
@@ -137,25 +181,12 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"错误：{e}"
 
 
-def run_create_file(path: str, content: str = "") -> str:
-    """创建新文件"""
-    try:
-        fp = safe_path(path)
-        if fp.exists():
-            return f"错误：文件已存在：{path}"
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content, encoding='utf-8')
-        return f"已创建文件 {path} ({len(content)} 字节)"
-    except Exception as e:
-        return f"错误：{e}"
-
-
 TOOL_HANDLERS = {
     "bash": lambda **kw: run_bash(kw["command"]),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "create_file": lambda **kw: run_create_file(kw["path"], kw.get("content", "")),
+    "todo": lambda **kw: TODO.update(kw["items"]),
 }
 
 TOOLS = [
@@ -206,15 +237,30 @@ TOOLS = [
         }
     },
     {
-        "name": "create_file",
-        "description": "创建新文件",
+        "name": "todo",
+        "description": "更新任务列表。跟踪多步骤任务的进度。",
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "文件路径"},
-                "content": {"type": "string", "description": "文件内容", "default": ""}
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "description": "任务 ID"},
+                            "text": {"type": "string", "description": "任务描述"},
+                            "status": {
+                                "type": "string",
+                                "description": "任务状态",
+                                "enum": ["pending", "in_progress", "completed"]
+                            }
+                        },
+                        "required": ["id", "text", "status"]
+                    },
+                    "description": "任务列表"
+                }
             },
-            "required": ["path"]
+            "required": ["items"]
         }
     },
 ]
