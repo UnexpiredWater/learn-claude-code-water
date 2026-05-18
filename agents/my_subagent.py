@@ -1,14 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-my_subagent.py - 简易子 Agent 启动器
+my_subagent.py - Subagent 实现（父Agent + 子Agent 上下文隔离）
+
+参考 s04_subagent.py 文档实现:
+- 父 Agent 拥有 task 工具，可以派生子 Agent
+- 子 Agent 拥有独立的 messages[]，不污染父 Agent 上下文
+- 子 Agent 完成后只返回摘要文本给父 Agent
 
 用法:
-    python agents/my_subagent.py "你的任务描述"
+    python agents/my_subagent.py
     
-示例:
-    python agents/my_subagent.py "帮我分析当前项目的目录结构"
-    python agents/my_subagent.py "创建一个简单的 Python 计算器"
+    交互模式下输入任务，父 Agent 会自动决定是否委派子任务。
+
+架构:
+    Parent agent                     Subagent
+    +------------------+             +------------------+
+    | messages=[...]   |             | messages=[]      |  <-- fresh
+    |                  |  dispatch   |                  |
+    | tool: task       | ----------> | while tool_use:  |
+    |   prompt="..."   |             |   call tools     |
+    |                  |  summary    |   append results |
+    |   result = "..." | <---------- | return last text |
+    +------------------+             +------------------+
+
+    Parent context stays clean. Subagent context is discarded.
 """
 
 import os
@@ -34,20 +50,27 @@ else:
 
 MODEL = os.environ.get("MODEL_ID", "claude-sonnet-4-20250514")
 
-SYSTEM = f"""你是一个编码子 Agent，工作目录在 {WORKDIR}。
-你的任务是完成用户指定的目标。你可以使用以下工具：
-- bash: 运行 shell 命令
-- read_file: 读取文件内容
-- write_file: 写入文件内容（创建或覆盖文件）
-- edit_file: 替换文件中的文本
-- todo: 更新任务列表，跟踪多步骤任务的进度
+# 系统提示词
+SYSTEM = f"""你是一个编码 Agent，工作目录在 {WORKDIR}。
+你可以直接使用工具完成简单任务，也可以使用 task 工具将复杂任务委派给子 Agent。
+子 Agent 拥有独立的上下文，完成后只返回摘要。这样可以保持你的上下文清晰。
 
-使用 todo 工具来规划多步骤任务。开始任务前标记为 in_progress，完成后标记为 completed。
-完成所有任务后，请提供一个简洁的总结。
+使用 task 工具的场景：
+- 需要读取多个文件来获取信息
+- 需要执行多步骤的探索性任务
+- 任务结果可以用简短摘要表达
+"""
+
+SUBAGENT_SYSTEM = f"""你是一个编码子 Agent，工作目录在 {WORKDIR}。
+完成给定的任务，然后用简洁的文字总结你的发现。
+你可以使用 bash、read_file、write_file、edit_file 和 todo 工具。
 """
 
 
-# -- TodoManager: 结构化状态管理 --
+# ============================================================
+# TodoManager: 结构化状态管理
+# ============================================================
+
 class TodoManager:
     def __init__(self):
         self.items = []
@@ -90,7 +113,10 @@ class TodoManager:
 TODO = TodoManager()
 
 
-# -- 工具实现 --
+# ============================================================
+# 工具实现（父 Agent 和子 Agent 共享）
+# ============================================================
+
 def safe_path(p: str) -> Path:
     """确保路径在 workspace 内"""
     path = (WORKDIR / p).resolve()
@@ -105,7 +131,7 @@ def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "错误：危险命令已被阻止"
-    
+
     # Windows 兼容性：将常见 Unix 命令转换为 Windows 命令
     cmd = command
     if os.name == 'nt':  # Windows
@@ -132,7 +158,7 @@ def run_bash(command: str) -> str:
         ]
         for unix_cmd, win_cmd in replacements:
             cmd = cmd.replace(unix_cmd, win_cmd)
-    
+
     try:
         r = subprocess.run(
             cmd, shell=True, cwd=WORKDIR,
@@ -181,6 +207,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"错误：{e}"
 
 
+# 工具处理器映射
 TOOL_HANDLERS = {
     "bash": lambda **kw: run_bash(kw["command"]),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -189,7 +216,13 @@ TOOL_HANDLERS = {
     "todo": lambda **kw: TODO.update(kw["items"]),
 }
 
-TOOLS = [
+
+# ============================================================
+# 工具定义
+# ============================================================
+
+# 子 Agent 拥有的基础工具（不包含 task，禁止递归派生）
+CHILD_TOOLS = [
     {
         "name": "bash",
         "description": "运行 shell 命令",
@@ -238,7 +271,7 @@ TOOLS = [
     },
     {
         "name": "todo",
-        "description": "更新任务列表。跟踪多步骤任务的进度。",
+        "description": "更新任务列表，跟踪多步骤任务的进度",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -265,37 +298,62 @@ TOOLS = [
     },
 ]
 
+# 父 Agent 的工具 = 基础工具 + task 工具（仅父端拥有）
+PARENT_TOOLS = CHILD_TOOLS + [
+    {
+        "name": "task",
+        "description": "派生一个子 Agent，它拥有独立的上下文（messages=[]）。"
+                       "子 Agent 共享文件系统但不共享对话历史。"
+                       "适合委派探索性任务、多文件读取、复杂操作等。"
+                       "只有最终摘要会返回给你。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "给子 Agent 的任务描述"},
+                "description": {"type": "string", "description": "简短的任务描述（用于日志）"}
+            },
+            "required": ["prompt"]
+        }
+    },
+]
 
-def run_agent(task: str) -> str:
-    """运行子 Agent 完成任务"""
-    messages = [{"role": "user", "content": f"任务：{task}"}]
-    
-    print(f"\n🤖 子 Agent 开始执行任务：{task}\n")
-    
-    for i in range(30):  # 最大迭代次数
+
+# ============================================================
+# Subagent: 独立上下文，执行完毕后只返回摘要
+# ============================================================
+
+def run_subagent(prompt: str) -> str:
+    """
+    启动一个子 Agent：
+    - 全新的 messages=[]（上下文隔离）
+    - 只拥有基础工具（无 task，禁止递归派生）
+    - 执行完毕后只返回最终文本摘要
+    - 子 Agent 的完整消息历史被丢弃
+    """
+    sub_messages = [{"role": "user", "content": prompt}]  # 全新上下文
+
+    response = None
+    for _ in range(30):  # 安全上限
         response = client.messages.create(
             model=MODEL,
-            system=SYSTEM,
-            messages=messages,
-            tools=TOOLS,
+            system=SUBAGENT_SYSTEM,
+            messages=sub_messages,
+            tools=CHILD_TOOLS,
             max_tokens=8000,
         )
-        
-        messages.append({"role": "assistant", "content": response.content})
-        
-        # 如果没有工具调用，说明任务完成
+        sub_messages.append({"role": "assistant", "content": response.content})
+
+        # 如果没有工具调用，任务完成
         if response.stop_reason != "tool_use":
             break
-            
+
         # 处理工具调用
         results = []
         for block in response.content:
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
                 if handler:
-                    print(f"  🔧 使用工具：{block.name}")
                     output = handler(**block.input)
-                    print(f"     结果：{str(output)[:100]}...")
                 else:
                     output = f"未知工具：{block.name}"
                 results.append({
@@ -303,35 +361,114 @@ def run_agent(task: str) -> str:
                     "tool_use_id": block.id,
                     "content": str(output)[:50000]
                 })
-        
+        sub_messages.append({"role": "user", "content": results})
+
+    # 只返回最终文本 -- 子 Agent 的完整上下文在此丢弃
+    if response is None:
+        return "(子 Agent 未执行)"
+    return "".join(
+        b.text for b in response.content if hasattr(b, "text")
+    ) or "(无摘要)"
+
+
+# ============================================================
+# 父 Agent 循环
+# ============================================================
+
+def agent_loop(messages: list):
+    """
+    父 Agent 的主循环：
+    - 调用 LLM
+    - 处理工具调用（包括 task 工具，会派生子 Agent）
+    - 直到 LLM 不再请求工具为止
+    """
+    while True:
+        response = client.messages.create(
+            model=MODEL,
+            system=SYSTEM,
+            messages=messages,
+            tools=PARENT_TOOLS,
+            max_tokens=8000,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+
+        # 如果没有工具调用，结束循环
+        if response.stop_reason != "tool_use":
+            return
+
+        # 处理工具调用
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                if block.name == "task":
+                    # 派生子 Agent（上下文隔离的核心）
+                    desc = block.input.get("description", "子任务")
+                    prompt = block.input.get("prompt", "")
+                    print(f"\n  🚀 派生子任务 ({desc}): {prompt[:80]}")
+                    output = run_subagent(prompt)
+                    print(f"  📋 子任务返回: {str(output)[:200]}")
+                else:
+                    # 普通工具调用
+                    handler = TOOL_HANDLERS.get(block.name)
+                    if handler:
+                        output = handler(**block.input)
+                    else:
+                        output = f"未知工具：{block.name}"
+                    print(f"  🔧 {block.name}: {str(output)[:150]}")
+
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": str(output)
+                })
         messages.append({"role": "user", "content": results})
-    
-    # 提取最终结果
-    result_parts = []
-    for block in response.content:
-        if hasattr(block, "text") and block.text:
-            result_parts.append(block.text)
-    
-    result = "\n".join(result_parts) if result_parts else "(无结果)"
-    print(f"\n✅ 任务完成\n")
-    return result
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("用法：python agents/my_subagent.py \"任务描述\"")
-        print("\n示例:")
-        print('  python agents/my_subagent.py "分析当前项目结构"')
-        print('  python agents/my_subagent.py "创建一个简单的 Python 计算器"')
-        sys.exit(1)
-    
-    task = " ".join(sys.argv[1:])
-    result = run_agent(task)
-    print("=" * 60)
-    print("📋 执行结果:")
-    print("=" * 60)
-    print(result)
-
+# ============================================================
+# 入口：支持交互模式和命令行模式
+# ============================================================
 
 if __name__ == "__main__":
-    main()
+    # 命令行模式：python agents/my_subagent.py "任务描述"
+    if len(sys.argv) >= 2:
+        task = " ".join(sys.argv[1:])
+        print(f"\n🤖 父 Agent 开始处理任务：{task}\n")
+        history = [{"role": "user", "content": task}]
+        agent_loop(history)
+        # 打印最终回复
+        response_content = history[-1]["content"]
+        if isinstance(response_content, list):
+            for block in response_content:
+                if hasattr(block, "text"):
+                    print(f"\n{block.text}")
+        print()
+        sys.exit(0)
+
+    # 交互模式
+    print("=" * 60)
+    print("🤖 Subagent 模式 - 父 Agent 可委派子任务")
+    print("   子 Agent 拥有独立上下文，完成后只返回摘要")
+    print("   父 Agent 上下文保持清洁")
+    print("=" * 60)
+    print("输入任务 (q/exit 退出):\n")
+
+    history = []
+    while True:
+        try:
+            query = input("\033[36msubagent >> \033[0m")
+        except (EOFError, KeyboardInterrupt):
+            print("\n👋 再见！")
+            break
+        if query.strip().lower() in ("q", "exit", ""):
+            break
+
+        history.append({"role": "user", "content": query})
+        agent_loop(history)
+
+        # 打印最终回复
+        response_content = history[-1]["content"]
+        if isinstance(response_content, list):
+            for block in response_content:
+                if hasattr(block, "text"):
+                    print(f"\n{block.text}")
+        print()
